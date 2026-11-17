@@ -10,6 +10,9 @@
 
 将 **[muse.ai](https://muse.ai/)** 网页端的前沿多模态能力逆向工程封装为标准的 **OpenAI 兼容 RESTful API**。通过无头浏览器 CDP 协议穿透、热备 WebSocket 隧道复用与动态 Session 管理，原生支持文本对话（2~3 秒级流式首字响应）、文生图、图生图编辑、文生视频、首帧图生视频，并提供多账号池亲和轮转、全自动 48 小时会话续期与云端 VM 唤醒保活，以及配套 Chrome 一键导号扩展。
 
+> **📌 本 Fork 的改动：固定会话（Pinned Threads）** — 本 Fork 在上游 v1.6.11 基础上增加固定会话：同一调用方（API Key + `user`）的对话固定在同一个 Muse 会话里，不再每次调用新开一个会话。详见 [固定会话](#15-固定会话pinned-threads本-fork-新增)；设计文档见 [PIN_DESIGN.md](PIN_DESIGN.md)，构建说明见 [BUILD_NOTE.md](BUILD_NOTE.md)。
+> **Pinned Threads (new in this fork):** on top of upstream v1.6.11, calls from the same caller (API key + `user`) stay in the same Muse thread instead of opening a new thread each time.
+
 ---
 
 ## 🎬 推荐：COOL AI — 电商 AI 视频与图片一站式创作
@@ -55,6 +58,11 @@ Extension 1.0.3 requires a manual reload in every browser profile. Update checks
   - 原生支持 SSE 流式打字机输出（`stream=True`）与同步完整返回，内置热标签页与 Noise WebSocket 隧道亲和复用，**连续对话首字延迟仅需 2~3 秒**。
   - 支持多轮对话上下文、System Prompt 设定。
   - 内置模型智能别名映射，`gpt-4o`、`gpt-5`、`claude-sonnet-4`、`deepseek-chat` 等常用模型名自动路由。
+- 📌 **固定会话（Pinned Threads，本 Fork 新增）**
+  - 同一调用方（API Key + `user` 字段）的对话固定在同一个 Muse 会话里，不再每次调用新开一个会话；不同 `user` 各走各的会话，互不干扰。
+  - 不传 `user` 时行为与上游完全一致；固定会话打不开时自动开新会话并更新映射，不报错中断。
+  - 开关 `MUSE2API_PIN_THREADS`（默认开启），映射保存在 `data/pinned-threads.json`，详见 [固定会话](#15-固定会话pinned-threads本-fork-新增)。
+  - **Pinned Threads (new in this fork):** calls from the same caller (API key + `user`) stay in the same Muse thread instead of opening a new thread each time. Omitting `user` keeps upstream behavior.
 - 🎨 **高质量生图与图像编辑（Images Generations & Edits）**
   - 完全兼容 `/v1/images/generations`（文生图）与 `/v1/images/edits`（图生图/参考图编辑）接口。
   - 支持 `1:1`、`16:9`、`9:16`、`4:3`、`3:4` 等多画幅生成，支持单图或多图参考直传与去水印纯净输出。
@@ -94,7 +102,7 @@ Extension 1.0.3 requires a manual reload in every browser profile. Update checks
 
 1. **克隆代码并进入目录**：
    ```bash
-   git clone https://github.com/czg86389-hub/muse2api.git
+   git clone https://github.com/waylon1662/muse2api.git
    cd muse2api
    ```
 
@@ -259,6 +267,48 @@ curl -X POST "http://localhost:18610/v1/chat/completions" \
     "stream": false
   }'
 ```
+
+### 1.5 固定会话（Pinned Threads，本 Fork 新增）
+
+上游每个 API 调用都会在 Muse 账号里新开一个会话。本 Fork 增加固定会话：请求里带上 `user` 字段，同一调用方（API Key + `user`）的对话会固定在同一个 Muse 会话里，多轮上下文自然续上；不带 `user` 时行为与上游完全一致。
+
+```bash
+curl -X POST "http://localhost:18610/v1/chat/completions" \
+  -H "Authorization: Bearer m2a_your_secret_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "muse-spark",
+    "user": "thea",
+    "messages": [
+      {"role": "user", "content": "记住暗号：松柏-5820。只回复收到。"}
+    ],
+    "stream": false
+  }'
+```
+
+之后同一 `user` 再发请求，会回到同一个会话里继续：
+
+```bash
+curl -X POST "http://localhost:18610/v1/chat/completions" \
+  -H "Authorization: Bearer m2a_your_secret_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "muse-spark",
+    "user": "thea",
+    "messages": [
+      {"role": "user", "content": "刚才的暗号是什么？只回复暗号。"}
+    ],
+    "stream": false
+  }'
+```
+
+- 开关：`MUSE2API_PIN_THREADS=1`（默认开启），设为 `0` 关闭，关闭后恢复上游行为。
+- 映射关系（API Key + `user` → 会话链接 + 账号）保存在 `data/pinned-threads.json`，不要把它放进 git（已在 `.gitignore`）。
+- 同一 `user` 的请求串行执行，不会互相踩；固定会话打不开（比如会话被删了）时自动开一个新会话并更新映射，不报错。
+- 改名会话不影响固定，会话链接不变。
+- `/v1/responses` 同样支持 `user` 字段。设计细节见 [PIN_DESIGN.md](PIN_DESIGN.md)，构建与部署说明见 [BUILD_NOTE.md](BUILD_NOTE.md)。
+
+**English:** Upstream opens a new Muse thread for every API call. This fork adds pinned threads: include a `user` field in the request and calls from the same caller (API key + `user`) stay in the same Muse thread, so multi-turn context continues naturally. Omitting `user` keeps upstream behavior. Toggle with `MUSE2API_PIN_THREADS` (default on); the mapping is stored in `data/pinned-threads.json`. See [PIN_DESIGN.md](PIN_DESIGN.md) for design details.
 
 ### 2. 文生图（Image Generation）
 
