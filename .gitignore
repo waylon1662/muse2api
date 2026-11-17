@@ -64,3 +64,6 @@ Thumbs.db
 
 # Independent generation queue settings
 data/generation-queue.json
+
+# Pinned chat threads: (key_id, user) -> thread URL + account_id（运行时生成，不进 git）
+data/pinned-threads.json

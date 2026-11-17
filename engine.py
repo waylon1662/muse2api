@@ -35,6 +35,7 @@ import unicodedata
 
 from cdp import CDP, http_json
 from proxy import HTTPProxyRelay, request_proxy_context
+from threads import normalize_thread_url
 
 log = logging.getLogger("muse2api")
 
@@ -237,6 +238,15 @@ class MuseSessionUnavailable(MuseGenerationError):
         self.rotated = rotated
 
 
+class PinnedThreadGoneError(MuseGenerationError):
+    """打开已固定的会话 URL 失败（会话被删 / 无权访问 / 被重定向走）。
+
+    调用方应丢弃旧映射并新开会话重新保存，而不是把这次调用算作失败。
+    只在“页面已加载、但落点不是目标会话”时抛出；页面本身没加载出来
+    （网络抖动等）仍走原来的超时/重试路径，不丢映射。
+    """
+
+
 class MuseModelRefusalError(MuseGenerationError):
     """Muse completed the turn with text instead of the requested media."""
 
@@ -356,6 +366,36 @@ class MuseEngine:
     @current_context_id.setter
     def current_context_id(self, val: str | None):
         self._ensure_local().current_context_id = val
+
+    @property
+    def last_thread_url(self) -> str | None:
+        """本线程最近一次采样到的具体会话 URL（形如 https://muse.ai/thread/<id>）。
+
+        由 chat_stream 在发送后、首字后、结束时采样更新；调用方（app.py）
+        在一轮结束后读它写进固定会话对照表。线程局部：多账号并发时互不干扰。
+        """
+        return getattr(self._ensure_local(), "last_thread_url", None)
+
+    @last_thread_url.setter
+    def last_thread_url(self, val: str | None):
+        self._ensure_local().last_thread_url = val
+
+    def _sample_thread_url(self) -> str | None:
+        """采样当前地址栏；是具体会话 URL 时更新 last_thread_url 并返回。
+
+        还在 /thread/new（会话未生成 URL）或采样失败时，返回上一次采到的值，
+        不覆盖、不清空。
+        """
+        if not self.page:
+            return self.last_thread_url
+        try:
+            href = self.page.js("location.href") or ""
+        except Exception:  # noqa: BLE001
+            return self.last_thread_url
+        url = normalize_thread_url(href)
+        if url:
+            self.last_thread_url = url
+        return self.last_thread_url
 
     # ---------------- 浏览器生命周期 ----------------
     def _debug_url(self):
@@ -738,13 +778,23 @@ class MuseEngine:
             time.sleep(0.1)
         return False
 
-    def reset_thread(self, for_chat: bool = False):
+    def reset_thread(self, for_chat: bool = False, pinned: bool = False,
+                     thread_url: str | None = None):
         """关闭残留弹窗并确保处于干净会话且 WebSocket 已就绪。
-        对于纯文本对话（for_chat=True），若当前热页面无附件、无卡死且气泡数较少，直接复用现有热连接以实现 2s 级秒回。"""
+        对于纯文本对话（for_chat=True），若当前热页面无附件、无卡死且气泡数较少，直接复用现有热连接以实现 2s 级秒回。
+
+        pinned=True（固定会话）时：
+          - 跳过 24 气泡规则：固定会话本来就是要长期续写的，聊过 12 轮后
+            不能再被悄悄导航回 /thread/new；
+          - 需要导航时目标改成保存的 thread_url，而不是 /thread/new；
+          - 导航后的就绪等待不再要求气泡数为 0（旧会话本来就有历史气泡），
+            只等输入框就绪。
+        媒体路径仍走 reset_thread(for_chat=False) 且不传 pinned，不受影响。
+        """
         if not self.page:
             return
         try:
-            needs_nav = self.page.js("""(function(forChat){
+            needs_nav = self.page.js("""(function(forChat, pinned){
                 var d = document.querySelector('[role="dialog"]');
                 if (d) {
                     var b = d.querySelector('button[aria-label*="close" i], button');
@@ -760,12 +810,18 @@ class MuseEngine:
                 var hasStuck = bodyTxt.indexOf('Still sending') !== -1 || bodyTxt.indexOf('Connecting...') !== -1;
                 if (hasStop || hasStuck || hasAtts) return true;
                 if (forChat) {
-                    return bubbleCount >= 24;
+                    return pinned ? false : bubbleCount >= 24;
                 }
                 return (window.location.pathname !== '/thread/new') || bubbleCount > 0;
-            })(%s)""" % ("true" if for_chat else "false"))
+            })(%s, %s)""" % ("true" if for_chat else "false",
+                             "true" if pinned else "false"))
             if needs_nav:
-                self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+                target = thread_url if (pinned and thread_url) else "https://muse.ai/thread/new"
+                self.page.send("Page.navigate", {"url": target})
+                if pinned and thread_url:
+                    # 固定会话：历史气泡本来就有，只等输入框就绪，不要求气泡数为 0。
+                    self._wait_ws_ready(self.page, timeout=12.0)
+                    return
                 t_end = time.time() + 10.0
                 while time.time() < t_end:
                     time.sleep(0.08)
@@ -792,7 +848,10 @@ class MuseEngine:
         except Exception as e:  # noqa: BLE001
             log.warning("保存轮换后的 cookie 失败 %s: %s", account_id, e)
 
-    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
+    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None,
+                    thread_url: str | None = None):
+        """打开可用的聊天页。thread_url 给出时导航到该固定会话（而不是 /thread/new）；
+        落点不是目标会话时抛 PinnedThreadGoneError，调用方丢弃旧映射后重开。"""
         resolver = getattr(self, "proxy_resolver", None)
         local = self._ensure_local()
         # A lease snapshots routing; a concurrent config edit must never change its exit.
@@ -803,7 +862,13 @@ class MuseEngine:
                 and (account_id is None or getattr(self, "current_acc_id", None) == account_id)):
             try:
                 if self.page.js("!!document.querySelector('textarea')") and self._wait_ws_ready(self.page, timeout=8.0):
-                    return self.page
+                    if not thread_url:
+                        return self.page
+                    # 固定会话：热页必须正好是目标会话，否则关掉重开
+                    href = self.page.js("location.href") or ""
+                    if normalize_thread_url(href) == normalize_thread_url(thread_url):
+                        self.last_thread_url = normalize_thread_url(thread_url)
+                        return self.page
             except Exception:
                 pass
         self._close_page()
@@ -842,9 +907,23 @@ class MuseEngine:
         self.page = page  # Cleanup must also own pages that never become ready.
         self._ensure_local().proxy_config = proxy
         self._apply_cookies(page, cookies, expires)
-        page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+        target_url = normalize_thread_url(thread_url) or "https://muse.ai/thread/new"
+        page.send("Page.navigate", {"url": target_url})
         if self._wait_ws_ready(page, timeout=self.cfg.login_wait):
             self.current_acc_id = account_id
+            if thread_url:
+                # 固定会话：页面已加载，但落点不是目标会话（被删 / 无权访问 /
+                # 被重定向走）。只在能确认落点不对时抛，页面本身没加载出来
+                # （网络抖动）仍走下面的超时路径，不丢映射。
+                try:
+                    landed = normalize_thread_url(page.js("location.href") or "")
+                except Exception:  # noqa: BLE001
+                    landed = None
+                if landed != normalize_thread_url(thread_url):
+                    self._close_page()
+                    raise PinnedThreadGoneError(
+                        f"固定会话打不开（落点不是 {target_url}），请删除映射后重开会话")
+                self.last_thread_url = landed
             return page
         try:
             body = (page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or "").lower()
@@ -1557,13 +1636,22 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
-        """发一条消息，流式 yield 增量文本。"""
+                    stop_event=None, thread_url: str | None = None):
+        """发一条消息，流式 yield 增量文本。
+
+        thread_url 给出时打开该固定会话而不是新会话；过程中在发送后、首字后、
+        结束时采样 location.href，首次出现 /thread/<id> 形态的 URL 即记到
+        last_thread_url（调用方一轮结束后读它写进对照表）。URL 何时从
+        /thread/new 翻成 /thread/<id> 只能靠实测，所以三处都采样。
+        """
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
-        self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
+        self.last_thread_url = None
+        pinned = bool(thread_url)
+        self.ensure_page(cookies, expires, account_id=account_id, thread_url=thread_url)
+        self.reset_thread(for_chat=True, pinned=pinned, thread_url=thread_url)
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
+        self._sample_thread_url()
 
         t_sent = time.time()
         deadline = t_sent + timeout
@@ -1593,6 +1681,7 @@ class MuseEngine:
                 yield delta
                 last = cur
                 got_first = True
+                self._sample_thread_url()
                 break
 
         if not got_first:
@@ -1617,9 +1706,11 @@ class MuseEngine:
                 stable += 1
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
+                    self._sample_thread_url()
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
                 if has_stop and stable >= 80:
+                    self._sample_thread_url()
                     return
 
         raise MuseGenerationError("等待助手回复超时")

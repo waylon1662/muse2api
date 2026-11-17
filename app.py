@@ -53,8 +53,9 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
                     MuseModelRefusalError, RefImageSafetyError, reference_kind)
-from engine import MuseProxyError, MuseSessionUnavailable
+from engine import MuseProxyError, MuseSessionUnavailable, PinnedThreadGoneError
 from store import Store, account_expiry, min_expiry
+from threads import DEFAULT_KEY_ID, PinnedThreads
 from generation_timing import QueuePolicy, QueueSettings, TaskTiming
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 from thumbnails import (VIDEO_FORMATS, ThumbnailUnavailable, clear_thumbnail,
@@ -188,6 +189,33 @@ GEN_LOCK = ConcurrencyLock(limit=CFG.max_concurrency)
 ACCOUNT_POOL = AccountPoolManager(store)
 IMAGE_TASK_LOCK = threading.Lock()
 QUEUE_POLICY = QueuePolicy(os.path.join(CFG.data_dir, "generation-queue.json"))
+PINNED_THREADS = PinnedThreads(CFG.pinned_threads_file)
+
+
+class _PinLockRegistry:
+    """每 (key_id, user) 一把锁，让同一调用方的对话串行。
+
+    同一 user 的两次调用若并发，会各自开独立上下文往同一会话里写，
+    muse.ai 端如何处理未确认——所以必须串行。锁的持有时间覆盖
+    “打开会话 → 发消息 → 等回复完成 → 保存 URL”全程（见 safe_chat_stream）。
+    注册表只随不同 user 增长，本部署调用方很少，不做清理。
+    """
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._locks: dict[tuple[str, str], threading.Lock] = {}
+
+    def lock_for(self, key_id: str, user: str) -> threading.Lock:
+        with self._guard:
+            k = (key_id, user)
+            lk = self._locks.get(k)
+            if lk is None:
+                lk = threading.Lock()
+                self._locks[k] = lk
+            return lk
+
+
+PIN_LOCKS = _PinLockRegistry()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -393,12 +421,80 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
     return store.get_account(acc_id)
 
 
+# ------------------------- 固定会话 -------------------------
+
+def _resolve_pin(user: str | None) -> dict | None:
+    """解析固定会话，返回 {"key_id","user","account","thread_url"}，或 None。
+
+    不启用（MUSE2API_PIN_THREADS=0）或请求没带 user 时返回 None，行为与原来一致。
+    有旧映射时固定用映射里的账号；映射里的账号不可用（删了 / 禁用 / 无 cookie /
+    被标记不可用）则丢弃映射，当作全新调用方（account=None，调用方正常选号）。
+    """
+    if not CFG.pin_threads or not user:
+        return None
+    key_id = DEFAULT_KEY_ID
+    rec = PINNED_THREADS.get(key_id, user)
+    if rec:
+        acc = store.get_account(rec.get("account_id") or "")
+        if (acc and acc.get("enabled", True) and acc.get("cookies")
+                and acc.get("ok") is not False):
+            fixed = store.pick_account(preferred_id=acc["id"], rotate=False)
+            if fixed and fixed["id"] == acc["id"]:
+                return {"key_id": key_id, "user": user, "account": fixed,
+                        "thread_url": rec.get("thread_url")}
+        # 映射里的账号不可用：丢弃旧映射，下次成功后重新保存
+        PINNED_THREADS.delete(key_id, user)
+    return {"key_id": key_id, "user": user, "account": None, "thread_url": None}
+
+
+def _pick_account_for_chat(user: str | None):
+    """对话入口的选号：固定会话优先用映射里的账号，否则正常轮换。
+
+    返回 (account, pin_arg)：pin_arg 为 None 表示本次不固定；
+    否则传给 safe_chat_stream，里面做每 user 串行、重试不换号、成功后保存 URL。
+    """
+    pin = _resolve_pin(user)
+    if pin is not None:
+        acc = pin["account"] or store.pick_account(rotate=True)
+        pin_arg = {"key_id": pin["key_id"], "user": pin["user"],
+                   "thread_url": pin.get("thread_url")}
+        return acc, pin_arg
+    return store.pick_account(rotate=True), None
+
+
+def _save_pin_thread(pin: dict | None, account_id: str | None):
+    """把本轮采到的会话 URL 写进对照表（只存真正的 /thread/<id>，不存 /thread/new）。"""
+    if not pin or not account_id:
+        return
+    try:
+        url = engine.last_thread_url
+    except Exception:  # noqa: BLE001
+        return
+    if not url:
+        return
+    try:
+        PINNED_THREADS.save(pin["key_id"], pin["user"], account_id, url)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("保存固定会话映射失败: %s", exc)
+
+
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
-    """Acquire a generation slot before the account lease; release both after cleanup."""
+                     timeout: int, account_id: str | None, pin: dict | None = None):
+    """Acquire a generation slot before the account lease; release both after cleanup.
+
+    pin 为 {"key_id","user","thread_url"} 时启用固定会话：
+      - 同一 (key_id, user) 的调用在消费线程串行，锁覆盖“打开会话 → 发消息 →
+        等回复完成 → 保存 URL”全程；
+      - 打开保存的 thread_url 而不是新会话，成功后把采到的 URL 写进对照表；
+      - 重试仍用同一账号，绝不强制换号（换号会把会话带到别的账号）；
+      - 固定会话打不开（PinnedThreadGoneError）时丢弃旧映射，改开新会话重试一次。
+    """
     import queue
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
+    pin_lock = PIN_LOCKS.lock_for(pin["key_id"], pin["user"]) if pin else None
+    if pin_lock is not None and not pin_lock.acquire(timeout=timeout):
+        raise MuseGenerationError("同一会话正在被上一轮调用占用，请稍后再试")
 
     def worker():
         cur_id = account_id
@@ -407,6 +503,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         last_exc = None
         leased_id = None
         slot_acquired = False
+        pin_thread_url = (pin or {}).get("thread_url")
+        pin_invalidated = False
         try:
             slot_acquired = GEN_LOCK.acquire(timeout=timeout)
             if not slot_acquired:
@@ -419,19 +517,27 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if leased_id:
                         ACCOUNT_POOL.release(leased_id)
                         leased_id = None
-                    try:
-                        alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
-                    except Exception:
-                        break
-                    if not alt or alt["id"] == cur_id:
-                        if alt:
-                            leased_id = alt["id"]
-                        break
-                    cur_id = alt["id"]
-                    leased_id = cur_id
-                    cur_cookies = alt["cookies"]
-                    cur_exp = alt.get("cookies_exp")
-                    log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
+                    if pin:
+                        # 已固定会话：重试仍用同一账号，绝不换号。
+                        try:
+                            ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
+                        except Exception:
+                            break
+                        leased_id = cur_id
+                    else:
+                        try:
+                            alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
+                        except Exception:
+                            break
+                        if not alt or alt["id"] == cur_id:
+                            if alt:
+                                leased_id = alt["id"]
+                            break
+                        cur_id = alt["id"]
+                        leased_id = cur_id
+                        cur_cookies = alt["cookies"]
+                        cur_exp = alt.get("cookies_exp")
+                        log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
                 elif cur_id:
                     ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
                     leased_id = cur_id
@@ -449,12 +555,15 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     engine.start()
                     for chunk in engine.chat_stream(
                         cur_cookies, prompt, cur_exp, timeout,
-                        account_id=cur_id, stop_event=stop_event
+                        account_id=cur_id, stop_event=stop_event,
+                        thread_url=pin_thread_url,
                     ):
                         yielded = True
                         q.put(("data", chunk))
                         if stop_event.is_set():
                             return
+                    if pin:
+                        _save_pin_thread(pin, cur_id)
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
@@ -464,6 +573,19 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if cur_id:
                         store.mark(cur_id, False, str(exc))
                     engine.close_current_page()
+                    if yielded:
+                        break
+                except PinnedThreadGoneError as exc:
+                    last_exc = exc
+                    engine.close_current_page()
+                    if pin and not pin_invalidated:
+                        # 固定会话打不开了（被删 / 无权访问）：丢弃旧映射，
+                        # 下一次尝试改开新会话，成功后重新保存。
+                        PINNED_THREADS.delete(pin["key_id"], pin["user"])
+                        pin_thread_url = None
+                        pin_invalidated = True
+                        log.warning("固定会话打不开，已丢弃映射，改开新会话: %s", exc)
+                        continue
                     if yielded:
                         break
                 except Exception as exc:
@@ -506,6 +628,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 break
     finally:
         stop_event.set()
+        if pin_lock is not None:
+            pin_lock.release()
 
 
 class ImageRequest(BaseModel):
@@ -565,6 +689,8 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = None
     timeout: int | None = None
     prompt: str | None = None       # 兼容把 prompt 直接放顶层的客户端
+    user: str | None = None         # 固定会话标识：同一 user 固定落在同一个会话里；
+                                    # 不传则每次新开会话（原来行为）
     # 下面这些声明出来只是为了「能读到」，muse.ai 端不做对应处理
     tools: list | None = None
     tool_choice: object | None = None
@@ -580,6 +706,7 @@ class ResponsesRequest(BaseModel):
     stream: bool = False
     max_output_tokens: int | None = None
     timeout: int | None = None
+    user: str | None = None         # 固定会话标识，同 ChatRequest.user
     tools: list | None = None
     store: bool | None = None
 
@@ -1653,7 +1780,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
+    acc, pin = _pick_account_for_chat(req.user)
     if not acc:
         raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
 
@@ -1678,7 +1805,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
+                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pin=pin)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1740,7 +1867,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pin=pin))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1815,7 +1942,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
+    acc, pin = _pick_account_for_chat(req.user)
     if not acc:
         raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
 
@@ -1851,7 +1978,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "part": {"type": "output_text", "text": "",
                              "annotations": []}})
                 full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pin=pin):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1876,7 +2003,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pin=pin))
 
     try:
         text = await asyncio.to_thread(run)

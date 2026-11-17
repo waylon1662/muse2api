@@ -111,6 +111,13 @@ class Config:
     ref_image_private_fetch: bool = field(
         default_factory=lambda: _env("MUSE2API_REF_IMAGE_PRIVATE_FETCH", "0").strip() == "1")
 
+    # 固定会话：同一调用方（API Key + user）固定落在同一个 muse.ai 会话里，**默认开启**。
+    # 原理：把 (key_id, user) -> thread URL 记进 data/pinned-threads.json，下次调用
+    # 直接打开那个 URL 而不是 /thread/new。关闭后恢复原来的行为：每次调用新开会话。
+    # 注意：开关只决定“是否启用固定”，user 字段本身由请求决定（不传 user = 不固定）。
+    pin_threads: bool = field(
+        default_factory=lambda: _env("MUSE2API_PIN_THREADS", "1").strip() != "0")
+
     # 工具调用（function calling）协议适配开关，**默认关闭**。
     # 实测 muse.ai 的助手会明确拒绝输出"伪工具调用"（原话：「我不会按这种 JSON
     # 格式输出'伪工具调用'」），强行注入协议反而会污染正常回答。
@@ -149,6 +156,11 @@ class Config:
     @property
     def tasks_file(self) -> str:
         return os.path.join(self.data_dir, "tasks.json")
+
+    @property
+    def pinned_threads_file(self) -> str:
+        """固定会话对照表 data/pinned-threads.json（运行时生成，不进 git）。"""
+        return os.path.join(self.data_dir, "pinned-threads.json")
 
     def ensure_dirs(self):
         for d in (self.base_dir, self.data_dir, self.media_dir, self.download_dir,
