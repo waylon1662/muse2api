@@ -1,13 +1,13 @@
 {
-  "version": "1.6.12",
-  "updated_at": "2026-11-19",
+  "version": "1.6.14",
+  "updated_at": "2026-11-24",
   "repo": "https://github.com/czg86389-hub/muse2api",
   "highlights": [
-    "修复 #62：muse.ai 从 2026-11-19 起聊天里只显示约 498px 的缩略图，生成的图片因此变小。现在图片任务会打开 muse.ai 的图片查看器取原图（实测 1344x1792），取不到时仍返回缩略图并在日志里提示。",
-    "只影响图片任务；视频、对话与参考素材上传不变。无需升级浏览器插件。"
+    "1.6.14：muse.ai 过载时视频更快出结果。muse.ai 过载时，一次失败的视频要等 6~7 分钟才会说“503”，再换号重试又是一轮。现在只要最近 20 分钟内出现过过载回复，新的视频任务会同时在 2 个空闲账号上生成，先出片者为准，另一路立即取消（不记为账号异常、不再重试）。",
+    "muse.ai 正常时行为不变（单账号）；图片任务、指定账号的任务不并行。代价：过载期间每个视频消耗 2 个账号的额度。可用 MUSE2API_VIDEO_HEDGE=0 关闭，MUSE2API_VIDEO_HEDGE_WINDOW 调整时长。服务重启后会从最近的任务记录恢复并行状态。无需升级浏览器插件。"
   ],
   "highlights_en": [
-    "Fix #62: since 2026-11-19 muse.ai shows only a ~498px thumbnail in the chat, so generated images came back small. Image tasks now open muse.ai's image viewer and return the full-size picture (measured 1344x1792); if it cannot be opened the thumbnail is still returned and a warning is logged.",
-    "Images only; video, chat and reference uploads are unchanged. No extension upgrade is needed."
+    "1.6.14: faster videos while muse.ai is overloaded. A failed video turn takes 6-7 minutes before muse.ai reports the 503, and the retry is another full round. For 20 minutes after any overload reply, new video tasks now run on two idle accounts at once; the first finished video wins and the other attempt is cancelled at once (not booked as an account fault, not retried).",
+    "Nothing changes while muse.ai is healthy (one account); image tasks and tasks pinned to an account never run in parallel. Cost: during an overload each video uses two accounts' allowance. MUSE2API_VIDEO_HEDGE=0 turns it off, MUSE2API_VIDEO_HEDGE_WINDOW sets the duration. After a restart the state is restored from recent task records. No extension upgrade is needed."
   ]
 }

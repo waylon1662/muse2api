@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import queue
 import threading
 import time
 import uuid
@@ -53,7 +54,7 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
                     MuseModelRefusalError, RefImageSafetyError, reference_kind)
-from engine import MuseProxyError, MuseSessionUnavailable, PinnedThreadGoneError
+from engine import MuseProxyError, MuseServiceBusyError, MuseSessionUnavailable, PinnedThreadGoneError
 from store import Store, account_expiry, min_expiry
 from threads import DEFAULT_KEY_ID, PinnedThreads
 from generation_timing import QueuePolicy, QueueSettings, TaskTiming
@@ -63,6 +64,55 @@ from thumbnails import (VIDEO_FORMATS, ThumbnailUnavailable, clear_thumbnail,
 
 import sys
 log = logging.getLogger("muse2api")
+
+# Muse media-backend outages ("视频服务过载（503）") are retried; see _run_generation_locked.
+BUSY_RETRIES = max(0, int(os.environ.get("MUSE2API_BUSY_RETRIES", "3")))
+BUSY_RETRY_DELAY = max(0.0, float(os.environ.get("MUSE2API_BUSY_RETRY_DELAY", "20")))
+BUSY_RETRY_MIN_REMAINING = max(0.0, float(os.environ.get("MUSE2API_BUSY_RETRY_MIN_REMAINING", "180")))
+# While muse.ai is overloaded a failed video turn costs 6-7 minutes before it says so.
+# For a while after any overload reply, video tasks run on two accounts at once and the
+# first finished video wins; the other attempt is cancelled.
+VIDEO_HEDGE = os.environ.get("MUSE2API_VIDEO_HEDGE", "1") != "0"
+VIDEO_HEDGE_WINDOW = max(0.0, float(os.environ.get("MUSE2API_VIDEO_HEDGE_WINDOW", "1200")))
+VIDEO_HEDGE_LEASE_TIMEOUT = max(0.1, float(os.environ.get("MUSE2API_VIDEO_HEDGE_LEASE_TIMEOUT", "5")))
+_OVERLOAD_LOCK = threading.Lock()
+_last_overload = 0.0
+
+
+def _note_overload():
+    global _last_overload
+    with _OVERLOAD_LOCK:
+        _last_overload = time.monotonic()
+
+
+def _overload_recent() -> bool:
+    with _OVERLOAD_LOCK:
+        return _last_overload > 0 and time.monotonic() - _last_overload <= VIDEO_HEDGE_WINDOW
+
+
+def _seed_overload_from_tasks(tasks, now: float | None = None):
+    """After a restart, remember an outage that recent tasks already ran into."""
+    global _last_overload
+    now = time.time() if now is None else now
+    newest = 0.0
+    for task in tasks:
+        text = f"{task.get('error') or ''} {task.get('last_error') or ''}"
+        if "媒体服务暂时不可用" not in text:
+            continue
+        try:
+            newest = max(newest, float(task.get("updated_at") or 0))
+        except (TypeError, ValueError):
+            continue
+    age = now - newest
+    if newest and 0 <= age <= VIDEO_HEDGE_WINDOW:
+        with _OVERLOAD_LOCK:
+            _last_overload = max(_last_overload, time.monotonic() - age)
+        return True
+    return False
+
+
+class MuseCancelledError(MuseGenerationError):
+    """The parallel attempt was stopped because the other one already delivered."""
 log.setLevel(logging.INFO)
 if not log.handlers:
     _h = logging.StreamHandler(sys.stdout)
@@ -1279,6 +1329,12 @@ def _run_generation(prompt: str, kind: str, timeout: int,
     _generation_callback(on_queue, queued)
     if not acquired:
         raise MuseGenerationError("排队时限已到，尚未开始生成；请稍后重试或调整独立排队时限")
+    if (kind == "video" and not account_id and VIDEO_HEDGE and _overload_recent()
+            and _idle_account_count() >= 2 and GEN_LOCK.acquire(blocking=False)):
+        # Both slots now belong to the two parallel attempts, which release them.
+        return _run_generation_hedged(prompt, kind, timeout, on_progress, reference_image,
+                                      reference_images, on_acquired, on_account, on_queue,
+                                      on_error, queued, queue_timeout)
     try:
         return _run_generation_locked(prompt, kind, timeout, account_id,
                                       on_progress, reference_image, reference_images,
@@ -1289,12 +1345,90 @@ def _run_generation(prompt: str, kind: str, timeout: int,
         GEN_LOCK.release()
 
 
+def _idle_account_count() -> int:
+    with ACCOUNT_POOL.cond:
+        busy = set(ACCOUNT_POOL.busy_accounts)
+    return sum(1 for a in store.accounts
+               if a.get("enabled", True) and a.get("cookies") and a.get("id") not in busy)
+
+
+def _hedge_error(errors: list[BaseException]) -> BaseException:
+    """Report the failure that tells the caller the most."""
+    real = [e for e in errors if not isinstance(e, MuseCancelledError)] or errors
+    for kind in (MuseModelRefusalError, MuseServiceBusyError):
+        for exc in real:
+            if isinstance(exc, kind):
+                return exc
+    return real[0]
+
+
+def _run_generation_hedged(prompt, kind, timeout, on_progress, reference_image, reference_images,
+                           on_acquired, on_account, on_queue, on_error, queued, queue_timeout):
+    """Run one video on two accounts at once; the first delivered video wins.
+
+    The caller already holds two GEN_LOCK slots; each branch releases one.
+    """
+    results: "queue.Queue[tuple[int, bool, Any]]" = queue.Queue()
+    stops = [threading.Event(), threading.Event()]
+    once = threading.Lock()
+    acquired_sent = [False]
+    best_progress = [0]
+
+    def acquired_once():
+        with once:
+            if acquired_sent[0]:
+                return
+            acquired_sent[0] = True
+        _generation_callback(on_acquired)
+
+    def progress_max(value):
+        with once:
+            if value <= best_progress[0]:
+                return
+            best_progress[0] = value
+        _generation_callback(on_progress, value)
+
+    def branch(index: int):
+        try:
+            res = _run_generation_locked(
+                prompt, kind, timeout, None, progress_max, reference_image, reference_images,
+                on_acquired=acquired_once, on_account=on_account,
+                on_queue=on_queue if index == 0 else None,
+                on_error=on_error, queued=queued if index == 0 else 0.0,
+                queue_timeout=queue_timeout if index == 0 else VIDEO_HEDGE_LEASE_TIMEOUT,
+                stop_event=stops[index])
+            results.put((index, True, res))
+        except BaseException as exc:  # noqa: BLE001 - reported to the waiting caller
+            results.put((index, False, exc))
+        finally:
+            GEN_LOCK.release()
+
+    log.warning("【并行生成】muse.ai 近 %.0f 分钟内出现过载，本次视频同时在 2 个账号上生成，先出片者为准",
+                VIDEO_HEDGE_WINDOW / 60)
+    for index in range(2):
+        threading.Thread(target=branch, args=(index,), daemon=True,
+                         name=f"muse-hedge-{index}").start()
+    errors: list[BaseException] = []
+    for _ in range(2):
+        index, ok, value = results.get()
+        if ok:
+            stops[1 - index].set()
+            log.info("【并行生成】第 %d 路先出片（账号 %s），已取消另一路", index + 1, value[1])
+            return value
+        errors.append(value)
+    raise _hedge_error(errors)
+
+
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
                     deadline=None, on_acquired=None, on_account=None,
-                    on_queue=None, on_error=None, queued=0.0, queue_timeout=None) -> tuple[dict, str | None]:
+                    on_queue=None, on_error=None, queued=0.0, queue_timeout=None,
+                    stop_event: threading.Event | None = None) -> tuple[dict, str | None]:
+    def cancelled() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
     if queue_timeout is None:
         queue_timeout = QUEUE_POLICY.settings()["queue_timeout"]
 
@@ -1319,12 +1453,37 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     try:
         if on_acquired:
             on_acquired()
-        for attempt in range(2):
+        # Two attempts for ordinary failures; a temporary Muse media outage
+        # (MuseServiceBusyError) earns up to BUSY_RETRIES extra attempts after a pause.
+        attempt_limit, busy_used, attempt, first_busy = 2, 0, -1, None
+        while True:
+            attempt += 1
+            busy = isinstance(last_exc, MuseServiceBusyError)
+            if busy:
+                first_busy = first_busy or last_exc
+            if busy and busy_used < BUSY_RETRIES:
+                busy_used += 1
+                attempt_limit += 1
+            if attempt >= attempt_limit:
+                break
+            if cancelled():
+                raise MuseCancelledError("另一路并行生成已先出片，本路已取消")
             # Preserve the original failure, including a refusal at the deadline boundary.
             if isinstance(last_exc, MuseModelRefusalError) or time.monotonic() >= deadline:
                 if last_exc is not None:
-                    raise last_exc
+                    break
                 raise MuseGenerationError("生成时限已到（不含排队时间），已停止等待")
+            if busy:
+                # Each Muse turn already retries internally for minutes; only start
+                # another one when it can still finish inside the generation budget.
+                if deadline - time.monotonic() < BUSY_RETRY_DELAY + BUSY_RETRY_MIN_REMAINING:
+                    break
+                log.warning("Muse 媒体服务暂时不可用，%.0f 秒后第 %d 次重试", BUSY_RETRY_DELAY, attempt + 1)
+                if stop_event is not None:
+                    if stop_event.wait(BUSY_RETRY_DELAY):
+                        raise MuseCancelledError("另一路并行生成已先出片，本路已取消")
+                else:
+                    time.sleep(BUSY_RETRY_DELAY)
             if attempt > 0:
                 old_id = cur_acc["id"] if cur_acc else None
                 if old_id:
@@ -1335,7 +1494,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 except (MuseAuthError, MuseGenerationError):
                     raise last_exc
                 cur_acc = alt
-                if not alt or (old_id and alt["id"] == old_id):
+                # An outage is not tied to the account, so the same one may retry it.
+                if not alt or (old_id and alt["id"] == old_id and not busy):
                     break
             _generation_callback(on_account, cur_acc["id"], attempt + 1)
             try:
@@ -1353,6 +1513,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     reference_image = refs[0]
                 elif len(refs) > 1:
                     engine_kwargs["reference_images"] = refs
+                if stop_event is not None:
+                    engine_kwargs["stop_event"] = stop_event
                 res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
                                       timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                       account_id=cur_acc["id"], on_progress=on_progress,
@@ -1360,32 +1522,46 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
-            except MuseAuthError as exc:
-                last_exc = exc
-                store.mark(cur_acc["id"], False, str(exc))
-                engine.close_current_page()
-            except MuseProxyError as exc:
-                last_exc = exc
-                store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
-                engine.close_current_page()
-            except MuseGenerationError as exc:
-                last_exc = exc
-                store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:200]}")
-                try:
-                    engine.reset_thread()
-                except Exception:
-                    pass
-            except Exception as exc:
-                engine.close_current_page()
-                last_exc = MuseGenerationError(f"生成失败: {exc}")
+            except Exception as exc:  # noqa: BLE001 - dispatched below
+                if cancelled():
+                    # Stopped on purpose: not an account fault and never retried.
+                    raise MuseCancelledError("另一路并行生成已先出片，本路已取消") from exc
+                if isinstance(exc, MuseServiceBusyError):
+                    _note_overload()
+                last_exc = _record_generation_failure(cur_acc, exc)
             if on_error:
                 on_error(str(last_exc))
+        # A retry that only ran out of time says less than the outage that caused it.
+        if first_busy is not None and not isinstance(last_exc, (MuseServiceBusyError, MuseModelRefusalError,
+                                                                 MuseAuthError)):
+            raise first_busy
         raise last_exc
     finally:
         if cur_acc:
             ACCOUNT_POOL.release(cur_acc.get("id"))
         engine.close_current_page()
         _clear_account_proxy()
+
+
+def _record_generation_failure(cur_acc: dict, exc: Exception) -> Exception:
+    """Book one failed attempt against its account and return the error to keep."""
+    if isinstance(exc, MuseAuthError):
+        store.mark(cur_acc["id"], False, str(exc))
+        engine.close_current_page()
+        return exc
+    if isinstance(exc, MuseProxyError):
+        store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
+        engine.close_current_page()
+        return exc
+    if isinstance(exc, MuseGenerationError):
+        store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:200]}")
+        try:
+            engine.reset_thread()
+        except Exception:
+            pass
+        return exc
+    engine.close_current_page()
+    return MuseGenerationError(f"生成失败: {exc}")
 
 
 # ------------------------- 基础接口 -------------------------
@@ -3019,6 +3195,8 @@ async def _startup():
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
             store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+    if _seed_overload_from_tasks(store.list_tasks(200)):
+        log.warning("【并行生成】最近的任务遇到过 muse.ai 过载，视频将先按并行模式生成")
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)
